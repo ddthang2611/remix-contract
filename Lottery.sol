@@ -1,25 +1,19 @@
-// SPDX-License-Identifier: MIT
-
 pragma solidity ^0.8.26;
 
-import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
-import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
+import "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
+import "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
-contract Lottery is VRFConsumerBaseV2 {
+contract Lottery is VRFConsumerBaseV2Plus {
     mapping(address => bool) public operators;
 
-    // Chainlink VRF v2 configuration
-    VRFCoordinatorV2Interface private COORDINATOR;
-    uint64 public s_subscriptionId;
+    uint256 public s_subscriptionId;
     bytes32 public keyHash;
-    uint32 public callbackGasLimit = 200000;
+    uint32 public callbackGasLimit = 800000;
     uint16 public requestConfirmations = 3;
 
-    // VRF request tracking
     mapping(uint256 => bytes) public requestIdToLotteryId;
     mapping(bytes => bool) public lotteryRandomRequested;
 
-    // lottery info
     struct LotteryCycle {
         bytes previousId;
         bytes id;
@@ -36,12 +30,10 @@ contract Lottery is VRFConsumerBaseV2 {
         uint256 totalBalances;
         mapping(uint8 => LotteryCycle) cycles;
         mapping(bytes => uint8) ids;
-        uint8 totalCylces;
+        uint8 totalCycles;
     }
 
     LotteryInfo public lotteries;
-
-    // ticket info
 
     struct LotteryTicket {
         uint8[] numbers;
@@ -56,42 +48,70 @@ contract Lottery is VRFConsumerBaseV2 {
 
     mapping(bytes => LotteryTickets) lotteryTickets;
 
-    // lottery setting
     struct LotterySetting {
         uint8 numberSetting;
         uint8 maximunSetting;
         uint256 price;
         mapping(uint8 => uint8) rates;
     }
+
     mapping(bytes => LotterySetting) public lotterySettings;
     mapping(uint8 => LotterySetting) public settingDefault;
+
+    event LotteryActivated(
+        bytes idOld,
+        bytes idNew,
+        uint256 expired,
+        uint8 types
+    );
+    event LotteryInactivated(bytes id);
+    event TicketBought(
+        bytes idLottery,
+        bytes idTicket,
+        address buyer,
+        uint8[] numbers
+    );
+    event RandomRequested(bytes idLottery, uint256 requestId);
+    event RandomFulfilled(bytes idLottery, uint8[] result);
+    event RewardClaimed(
+        bytes idLottery,
+        bytes idTicket,
+        address winner,
+        uint256 amount
+    );
+    event Withdrawn(address indexed to, uint256 amount);
+
+    modifier onlyOperator() {
+        require(operators[msg.sender], "Permission required");
+        _;
+    }
 
     constructor(
         address vrfCoordinator,
         bytes32 _keyHash,
-        uint64 _subscriptionId
-    ) VRFConsumerBaseV2(vrfCoordinator) {
-        COORDINATOR = VRFCoordinatorV2Interface(vrfCoordinator);
+        uint256 _subscriptionId
+    ) VRFConsumerBaseV2Plus(vrfCoordinator) {
         keyHash = _keyHash;
         s_subscriptionId = _subscriptionId;
 
-        settingDefault[uint8(1)].numberSetting = 5;
-        settingDefault[uint8(1)].maximunSetting = 50;
-        settingDefault[uint8(1)].price = 10000000000;
-        settingDefault[uint8(1)].rates[1] = 60;
-        settingDefault[uint8(1)].rates[2] = 20;
-        settingDefault[uint8(1)].rates[3] = 10;
+        settingDefault[1].numberSetting = 5;
+        settingDefault[1].maximunSetting = 50;
+        settingDefault[1].price = 10000000000;
 
-        settingDefault[uint8(2)].numberSetting = 3;
-        settingDefault[uint8(2)].maximunSetting = 6;
-        settingDefault[uint8(2)].price = 10000000000;
+        settingDefault[1].rates[1] = 60;
+        settingDefault[1].rates[2] = 20;
+        settingDefault[1].rates[3] = 10;
+
+        settingDefault[2].numberSetting = 3;
+        settingDefault[2].maximunSetting = 6;
+        settingDefault[2].price = 10000000000;
 
         operators[msg.sender] = true;
     }
 
     function getLatestLottery() public view returns (LotteryCycle memory) {
-        require(lotteries.totalCylces > 0, "Haven't had any lottery, yet");
-        return lotteries.cycles[lotteries.totalCylces - 1];
+        require(lotteries.totalCycles > 0, "No lottery");
+        return lotteries.cycles[lotteries.totalCycles - 1];
     }
 
     function getLotteryResult(
@@ -106,19 +126,48 @@ contract Lottery is VRFConsumerBaseV2 {
         return lotteries.cycles[lotteries.ids[_id]];
     }
 
-    function inactiveLottery(bytes memory _id) public {
-        require(operators[msg.sender] == true, "Permission required");
-
+    function inactiveLottery(bytes memory _id) public onlyOperator {
         uint8 idx = lotteries.ids[_id];
-        if (lotteries.totalCylces == 0 || idx >= lotteries.totalCylces) {
+
+        if (lotteries.totalCycles == 0 || idx >= lotteries.totalCycles) {
             return;
         }
 
         LotteryCycle storage cycle = lotteries.cycles[idx];
-        if (cycle.isActive == true && !lotteryRandomRequested[_id]) {
+
+        if (cycle.isActive && !lotteryRandomRequested[_id]) {
             _requestRandomWordsForLottery(_id);
             cycle.isActive = false;
+
+            emit LotteryInactivated(_id);
         }
+    }
+
+    function addOperator(address _op) external onlyOwner {
+        operators[_op] = true;
+    }
+
+    function setResultForTesting(
+        bytes memory _id,
+        uint8[] calldata _result
+    ) external onlyOperator {
+        uint8 idx = lotteries.ids[_id];
+        require(idx < lotteries.totalCycles, "Invalid lottery id");
+
+        LotteryCycle storage cycle = lotteries.cycles[idx];
+        cycle.isActive = false;
+
+        require(
+            _result.length == lotterySettings[_id].numberSetting,
+            "Invalid result length"
+        );
+        delete cycle.result;
+
+        for (uint i = 0; i < _result.length; i++) {
+            cycle.result.push(_result[i]);
+        }
+
+        emit RandomFulfilled(_id, cycle.result);
     }
 
     function activeNewLottery(
@@ -126,14 +175,15 @@ contract Lottery is VRFConsumerBaseV2 {
         bytes memory _idOld,
         uint256 expired,
         uint8 types
-    ) public {
-        require(operators[msg.sender] == true, "Permission required");
+    ) public onlyOperator {
         inactiveLottery(_idOld);
+
         uint8[] memory result;
+
         LotteryCycle memory cycle = LotteryCycle(
             _idOld,
             _idNew,
-            lotteries.totalCylces,
+            lotteries.totalCycles,
             true,
             0,
             0,
@@ -141,64 +191,25 @@ contract Lottery is VRFConsumerBaseV2 {
             expired,
             types
         );
-        lotteries.cycles[lotteries.totalCylces] = cycle;
-        lotteries.ids[_idNew] = lotteries.totalCylces;
+
+        lotteries.cycles[lotteries.totalCycles] = cycle;
+        lotteries.ids[_idNew] = lotteries.totalCycles;
+
         lotterySettings[_idNew].numberSetting = settingDefault[types]
             .numberSetting;
         lotterySettings[_idNew].maximunSetting = settingDefault[types]
             .maximunSetting;
         lotterySettings[_idNew].price = settingDefault[types].price;
+
         uint8 i = 0;
         while (settingDefault[types].rates[i] != 0) {
             lotterySettings[_idNew].rates[i] = settingDefault[types].rates[i];
             i++;
         }
-        lotteries.totalCylces++;
-    }
 
-    function claimReward(
-        bytes memory _idLottery,
-        bytes memory _idTicket
-    ) public {
-        require(
-            lotteryTickets[_idLottery].tickets[_idTicket].buyer == msg.sender,
-            "Not buyer"
-        );
-        require(
-            lotteryTickets[_idLottery].tickets[_idTicket].isClaimed == false,
-            "Already claimed"
-        );
-        uint8[] memory numbers = lotteryTickets[_idLottery]
-            .tickets[_idTicket]
-            .numbers;
+        lotteries.totalCycles++;
 
-        if (lotteries.cycles[lotteries.ids[_idLottery]].types == 1) {
-            uint8[] memory result = lotteries
-                .cycles[lotteries.ids[_idLottery]]
-                .result;
-            require(result.length > 0, "Result not ready");
-            uint8 numberMatched = compare2Arrays(result, numbers);
-            uint8 rate = lotterySettings[_idLottery].rates[
-                numberMatched - uint8(result.length) + 1
-            ];
-            require(rate > 0, "Incapable of claiming reward");
-            uint8 amountOfDraw = getQuantityOfDrawPerLottery(
-                _idLottery,
-                numbers
-            );
-            uint256 prize = ((uint256(
-                lotteries.cycles[lotteries.ids[_idLottery]].totalBalances
-            ) * uint256(rate)) / 100) / uint256(amountOfDraw);
-
-            lotteries.cycles[lotteries.ids[_idLottery]].totalBalances -= prize;
-            lotteries.totalBalances -= prize;
-            lotteryTickets[_idLottery].tickets[_idTicket].isClaimed = true;
-            // return prize;
-            (bool success, ) = msg.sender.call{value: prize}("");
-            require(success, "Transfer failed");
-        } else {
-            revert("Not support lottery type");
-        }
+        emit LotteryActivated(_idOld, _idNew, expired, types);
     }
 
     function buyTicket(
@@ -207,97 +218,172 @@ contract Lottery is VRFConsumerBaseV2 {
         uint8[] memory numbers
     ) public payable {
         LotteryCycle memory currentLottery = getLotteryInfo(_idLottery);
-        require(
-            msg.value == lotterySettings[_idLottery].price,
-            "Price is wrong"
-        );
-        require(currentLottery.isActive == true, "Must buy in active lottery");
+
+        require(msg.value == lotterySettings[_idLottery].price, "Wrong price");
+        require(currentLottery.isActive, "Lottery inactive");
         require(
             numbers.length == lotterySettings[_idLottery].numberSetting,
-            "Number in ticket is invalid"
+            "Invalid numbers"
         );
         require(
             checkDuplicate(numbers, uint8(numbers.length)) == false,
-            "Number in ticket must not duplicated"
+            "Duplicated numbers"
         );
         require(
-            block.timestamp <= currentLottery.expired - 60 * 15,
-            "Lottery is closed."
+            block.timestamp <= currentLottery.expired - 15 minutes,
+            "Lottery closed"
         );
-        require(currentLottery.types == 1, "Invalid lottery type");
 
         LotteryTicket memory ticket = LotteryTicket(numbers, msg.sender, false);
+
         bytes32 numberPerDraw = keccak256(abi.encodePacked(numbers));
         lotteryTickets[_idLottery].amountPerDraw[numberPerDraw]++;
         lotteryTickets[_idLottery].tickets[_idTicket] = ticket;
 
         lotteries.cycles[lotteries.ids[_idLottery]].totalBalances += msg.value;
         lotteries.totalBalances += msg.value;
-    }
 
-    function getQuantityOfDrawPerLottery(
-        bytes memory _id,
-        uint8[] memory numbers
-    ) internal view returns (uint8) {
-        require(
-            numbers.length == lotterySettings[_id].numberSetting,
-            "Number in ticket is invalid"
-        );
-        bytes32 numberPerDraw = keccak256(abi.encodePacked(numbers));
-        return lotteryTickets[_id].amountPerDraw[numberPerDraw];
+        emit TicketBought(_idLottery, _idTicket, msg.sender, numbers);
     }
 
     function _requestRandomWordsForLottery(bytes memory _id) internal {
-        require(!lotteryRandomRequested[_id], "Random already requested");
+        require(!lotteryRandomRequested[_id], "Already requested");
 
         uint8 idx = lotteries.ids[_id];
-        require(idx < lotteries.totalCylces, "Invalid lottery id");
+        require(idx < lotteries.totalCycles, "Invalid lottery");
 
-        uint32 numWords = 1;
-        uint256 requestId = COORDINATOR.requestRandomWords(
-            keyHash,
-            s_subscriptionId,
-            requestConfirmations,
-            callbackGasLimit,
-            numWords
+        uint256 requestId = s_vrfCoordinator.requestRandomWords(
+            VRFV2PlusClient.RandomWordsRequest({
+                keyHash: keyHash,
+                subId: s_subscriptionId,
+                requestConfirmations: requestConfirmations,
+                callbackGasLimit: callbackGasLimit,
+                numWords: 1,
+                extraArgs: VRFV2PlusClient._argsToBytes(
+                    VRFV2PlusClient.ExtraArgsV1({nativePayment: false})
+                )
+            })
         );
 
         requestIdToLotteryId[requestId] = _id;
         lotteryRandomRequested[_id] = true;
+
+        emit RandomRequested(_id, requestId);
     }
 
     function fulfillRandomWords(
         uint256 requestId,
-        uint256[] memory randomWords
+        uint256[] calldata randomWords
     ) internal override {
         bytes memory _id = requestIdToLotteryId[requestId];
-        require(_id.length != 0, "Unknown requestId");
+        require(_id.length != 0, "Unknown request");
 
         uint8 idx = lotteries.ids[_id];
-        require(idx < lotteries.totalCylces, "Invalid lottery id");
-
         LotteryCycle storage cycle = lotteries.cycles[idx];
-        require(!cycle.isActive, "Lottery still active");
 
         uint8 numbersCount = lotterySettings[_id].numberSetting;
         uint8 maxNumber = lotterySettings[_id].maximunSetting;
-        require(numbersCount > 0 && maxNumber > 0, "Invalid settings");
 
         uint8[] memory result = new uint8[](numbersCount);
         uint256 seed = randomWords[0];
 
+        uint256 nonce = 0;
+
         for (uint8 i = 0; i < numbersCount; i++) {
             uint8 candidate;
             do {
-                candidate = uint8(
-                    (uint256(keccak256(abi.encode(seed, i))) % maxNumber) + 1
-                );
+                candidate =
+                    uint8(
+                        uint256(keccak256(abi.encode(seed, i, nonce))) %
+                            maxNumber
+                    ) +
+                    1;
+                nonce++;
             } while (_containsPrefix(result, i, candidate));
+
             result[i] = candidate;
         }
 
-        quickSort(result, uint8(0), uint8(result.length - 1));
+        quickSort(result, 0, numbersCount - 1);
         cycle.result = result;
+
+        emit RandomFulfilled(_id, result);
+    }
+
+    function claimReward(
+        bytes memory _idLottery,
+        bytes memory _idTicket
+    ) public {
+        uint8 idx = lotteries.ids[_idLottery];
+        LotteryCycle storage cycle = lotteries.cycles[idx];
+
+        require(!cycle.isActive, "Lottery is still active");
+        require(cycle.result.length > 0, "Result not ready yet");
+
+        LotteryTicket storage ticket = lotteryTickets[_idLottery].tickets[
+            _idTicket
+        ];
+        require(ticket.buyer == msg.sender, "You are not the ticket owner");
+        require(!ticket.isClaimed, "Reward already claimed");
+
+        uint8 matchCount = compare2Arrays(ticket.numbers, cycle.result);
+        bool isWinner = false;
+        uint256 rewardAmount = 0;
+
+        if (cycle.types == 1) {
+            // Loại 1 (5/50)
+            if (matchCount == 5) {
+                isWinner = true;
+                rewardAmount =
+                    (cycle.totalBalances *
+                        lotterySettings[_idLottery].rates[1]) /
+                    100;
+            } else if (matchCount == 4) {
+                isWinner = true;
+                rewardAmount =
+                    (cycle.totalBalances *
+                        lotterySettings[_idLottery].rates[2]) /
+                    100;
+            } else if (matchCount == 3) {
+                isWinner = true;
+                rewardAmount =
+                    (cycle.totalBalances *
+                        lotterySettings[_idLottery].rates[3]) /
+                    100;
+            }
+        } else if (cycle.types == 2) {
+            if (matchCount == 3) {
+                isWinner = true;
+                rewardAmount =
+                    (cycle.totalBalances *
+                        lotterySettings[_idLottery].rates[1]) /
+                    100;
+            }
+        }
+
+        require(isWinner, "Sorry, this ticket did not win");
+        require(rewardAmount > 0, "Reward amount is zero");
+        require(
+            address(this).balance >= rewardAmount,
+            "Contract has insufficient balance"
+        );
+
+        ticket.isClaimed = true;
+
+        // Tối ưu an toàn sử dụng .call thay vì .transfer
+        (bool success, ) = msg.sender.call{value: rewardAmount}("");
+        require(success, "Transfer failed");
+
+        emit RewardClaimed(_idLottery, _idTicket, msg.sender, rewardAmount);
+    }
+
+    function withdraw(uint256 amount, address payable to) external onlyOwner {
+        require(address(this).balance >= amount, "Insufficient balance");
+
+        (bool success, ) = to.call{value: amount}("");
+        require(success, "Transfer failed");
+
+        emit Withdrawn(to, amount);
     }
 
     function _containsPrefix(
@@ -321,12 +407,13 @@ contract Lottery is VRFConsumerBaseV2 {
         uint8 i = left;
         uint8 j = right;
         if (i == j) return;
-        uint8 pivot = arr[uint8(left + (right - left) / 2)];
+        uint8 pivot = arr[left + (right - left) / 2];
+
         while (i <= j) {
-            while (arr[uint8(i)] < pivot) i++;
-            while (pivot < arr[uint8(j)]) j--;
+            while (arr[i] < pivot) i++;
+            while (pivot < arr[j]) j--;
             if (i <= j) {
-                (arr[uint8(i)], arr[uint8(j)]) = (arr[uint8(j)], arr[uint8(i)]);
+                (arr[i], arr[j]) = (arr[j], arr[i]);
                 i++;
                 j--;
             }
