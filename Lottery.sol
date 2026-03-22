@@ -304,7 +304,8 @@ contract Lottery is VRFConsumerBaseV2Plus {
             result[i] = candidate;
         }
 
-        quickSort(result, 0, numbersCount - 1);
+        // quickSort(result, 0, numbersCount - 1);
+        sortNumbers(result);
         cycle.result = result;
 
         emit RandomFulfilled(_id, result);
@@ -420,6 +421,20 @@ contract Lottery is VRFConsumerBaseV2Plus {
         }
         if (left < j) quickSort(arr, left, j);
         if (i < right) quickSort(arr, i, right);
+    }
+
+    function sortNumbers(uint8[] memory arr) internal pure {
+        uint256 length = arr.length;
+        for (uint256 i = 0; i < length; i++) {
+            for (uint256 j = i + 1; j < length; j++) {
+                if (arr[i] > arr[j]) {
+                    // Đổi chỗ 2 phần tử nếu phần tử trước lớn hơn phần tử sau
+                    uint8 temp = arr[i];
+                    arr[i] = arr[j];
+                    arr[j] = temp;
+                }
+            }
+        }
     }
 
     function checkDuplicate(
